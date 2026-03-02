@@ -28,7 +28,14 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
-
+try:
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import StreamingResponse
+    from pydantic import BaseModel
+    _FASTAPI_AVAILABLE = True
+except ImportError:
+    _FASTAPI_AVAILABLE = False
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -782,3 +789,161 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nCancelled by user.\n")
         sys.exit(0)
+
+# ---------------------------------------------------------------------------
+# FastAPI server
+# Run with:  uvicorn compatability:app --reload --port 8000
+# ---------------------------------------------------------------------------
+
+if not _FASTAPI_AVAILABLE:
+    raise ImportError("FastAPI not installed. Run: pip install fastapi uvicorn")
+
+app = FastAPI(title="PC Build Advisor")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000"
+        ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class RunRequest(BaseModel):
+    # The exact `selected` object built in App.tsx onRun():
+    #   keys: component names + "_use_case" + "Budget" + "Mode"
+    selected: dict[str, str]
+    openai_api_key: str
+
+
+def _build_searches(selected: dict[str, str]) -> tuple[list, float, str, str]:
+    """
+    Parse the `selected` dict from the frontend into the structures
+    that the existing compatibility / prompt functions expect.
+    Returns: (searches, budget, use_case, mode)
+    """
+    use_case   = selected.get("_use_case", "General use / gaming")
+    mode       = selected.get("Mode", "Full PC build")
+    budget_raw = selected.get("Budget", "0").replace("$", "").replace(",", "").strip()
+    try:
+        budget = float(budget_raw)
+    except ValueError:
+        budget = 0.0
+
+    # Build preferences — blank out "(any)" placeholders the frontend sends
+    preferences: dict[str, str] = {}
+    for component in COMPONENT_FILES:
+        val = selected.get(component, "")
+        preferences[component] = "" if val in ("", "(any)") else val
+
+    loader   = DatasetLoader(DATASET_DIR)
+    searches = search_dataset(loader, preferences)
+    return searches, budget, use_case, mode
+
+
+def _fmt_compat(issues: list) -> str:
+    """Format compat issues for the frontend Compatibility Issues panel."""
+    if not issues:
+        return "No compatibility issues detected."
+
+    lines: list[str] = []
+    for sev, label in [(ERROR, "ERRORS"), (WARNING, "WARNINGS"), (INFO, "NOTES")]:
+        group = [i for i in issues if i.severity == sev]
+        if not group:
+            continue
+        lines.append(f"── {label} ──")
+        for issue in group:
+            icon = {"ERROR": "❌", "WARNING": "⚠️", "INFO": "ℹ️"}.get(issue.severity, "•")
+            lines.append(f"{icon}  [{', '.join(issue.components)}]")
+            lines.append(f"   {issue.message}")
+            lines.append("")
+
+    errors   = sum(1 for i in issues if i.severity == ERROR)
+    warnings = sum(1 for i in issues if i.severity == WARNING)
+    infos    = sum(1 for i in issues if i.severity == INFO)
+    lines.append(f"Summary: {errors} error(s), {warnings} warning(s), {infos} note(s)")
+    return "\n".join(lines)
+
+
+@app.post("/run")
+def run_endpoint(req: RunRequest):
+    """
+    Single-call endpoint — returns both compat issues and full AI output at once.
+    Frontend sets setCompatIssues and setAiOutput from the response.
+    """
+    searches, budget, use_case, mode = _build_searches(req.selected)
+
+    issues       = run_compatibility_check(searches)
+    compat_text  = _fmt_compat(issues)
+    compat_block = _compat_for_gpt(issues)
+    dataset_blk  = _dataset_block(searches)
+
+    preferences = {c: (req.selected.get(c) or "") for c in COMPONENT_FILES}
+    prompt      = build_full_prompt(preferences, budget, use_case, dataset_blk, compat_block)
+
+    client    = OpenAI(api_key=req.openai_api_key)
+    ai_output = get_recommendations(client, prompt)
+
+    return {"compat_issues": compat_text, "ai_output": ai_output}
+
+
+@app.post("/stream")
+def stream_endpoint(req: RunRequest):
+    """
+    Streaming endpoint (SSE).
+    Sends compat issues first, then streams AI tokens.
+    Event format:  data: {"type": "compat"|"token"|"done", "text": "..."}
+    """
+    searches, budget, use_case, mode = _build_searches(req.selected)
+
+    issues       = run_compatibility_check(searches)
+    compat_text  = _fmt_compat(issues)
+    compat_block = _compat_for_gpt(issues)
+    dataset_blk  = _dataset_block(searches)
+
+    preferences = {c: (req.selected.get(c) or "") for c in COMPONENT_FILES}
+    prompt      = build_full_prompt(preferences, budget, use_case, dataset_blk, compat_block)
+    client      = OpenAI(api_key=req.openai_api_key)
+
+    def generate():
+        # Send compat results immediately so the UI updates before AI starts
+        yield f"data: {json.dumps({'type': 'compat', 'text': compat_text})}\n\n"
+
+        with client.chat.completions.stream(
+            model="gpt-4o",
+            max_tokens=2500,
+            temperature=0.7,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior PC hardware expert. "
+                        "You have deep knowledge of CPU socket compatibility, chipset features, "
+                        "RAM DDR generations, PSU sizing, case form factors, GPU power requirements, "
+                        "NVMe generations, and current market pricing as of early 2025. "
+                        "You independently verify compatibility rather than just repeating automated checks. "
+                        "You prioritize recommending the best parts for the user's use case and budget. "
+                        "You are direct and specific: name exact incompatibilities and always suggest a fix."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        ) as stream:
+            for event in stream:
+                print(event)
+                if event.type == "response.output_text.delta":
+                    yield f"data: {json.dumps({'type': 'token', 'text': event.delta})}\n\n"
+                elif event.type == "content.delta":
+                    yield f"data: {json.dumps({'type': 'token', 'text': event.delta})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

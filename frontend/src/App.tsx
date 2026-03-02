@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./styles.css";
 
+const API_BASE_URL = 'http://localhost:8000';
+
 type Mode = "full" | "upgrade";
 
 type PartItem = {
@@ -239,32 +241,66 @@ export default function App() {
 
       const selected = {
         CPU: form.cpu || "(any)",
-        GPU: form.gpu || "(any)",
+        "Video Card (GPU)": form.gpu || "(any)",
         Motherboard: form.motherboard || "(any)",
-        RAM: form.ram || "(any)",
-        PSU: form.psu || "(any)",
+        "Memory (RAM)": form.ram || "(any)",
+        "Power Supply (PSU)": form.psu || "(any)",
         Storage: form.storage || "(any)",
         "CPU Cooler": form.cpuCooler || "(any)",
         Monitor: form.monitor || "(any)",
         Case: form.case || "(any)",
         "Operating System": form.operatingSystem || "(any)",
-        "Primary Use": form.primaryUse,
+        "_use_case": form.primaryUse,
         Budget: `$${budget.toFixed(2)}`,
         Mode: mode === "full" ? "Full PC build" : "Upgrade recommendation",
       };
 
-      setCompatIssues(
-        "No compatibility engine connected yet.\n\nSelected:\n" +
-          Object.entries(selected)
-            .map(([k, v]) => `• ${k}: ${v}`)
-            .join("\n")
-      );
+      const apiKey = import.meta.env.VITE_OPENAI_API_KEY ?? "";
 
-      setAiOutput(
-        mode === "full"
-          ? "AI build output will appear here once your backend is hooked up."
-          : "AI upgrade recommendations will appear here once your backend is hooked up."
-      );
+      const res = await fetch(`${API_BASE_URL}/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selected, openai_api_key : apiKey })
+      });
+
+      if (!res.ok || !res.body) {
+        const text = await res.text();
+        throw new Error(`Server error ${res.status}: ${text}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let aiAccum = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, {stream: true});
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const payload = line.slice(6).trim();
+          try {
+            const msg = JSON.parse(payload) as { type: string; text?: string };
+            if (msg.type === "compat" && msg.text) {
+              setCompatIssues(msg.text);
+            } else if (msg.type === "token" && msg.text) {
+              aiAccum += msg.text;
+              setAiOutput(aiAccum);
+            }
+          } catch {
+            
+          }
+        }
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setCompatIssues(`Error: ${message}`);
+      setAiOutput("—");
     } finally {
       setIsLoading(false);
     }
